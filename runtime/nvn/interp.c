@@ -1270,12 +1270,14 @@ void interp_log_stats(void) {
         s_shots / dt, s_mids / dt, (unsigned long long)s_late, (unsigned long long)s_skipped,
         s_replays ? s_replay_cpu / s_replays : 0, s_replay_cpu_max, gn ? s_replay_gpu / gn : 0, cn ? s_compose_gpu / cn : 0,
         s_prep / n, s_frames ? s_L / n : 0, o ? cuts : " none");
+#ifdef __APPLE__  // (renderer.m's: this file builds on every platform, the Vulkan backends have no replays yet)
     {   extern void renderer_interp_geo_stats(uint64_t *binds, uint64_t *differed, uint64_t *missed);
         uint64_t gb, gd, gm;
         renderer_interp_geo_stats(&gb, &gd, &gm);
         if (gb || gm) LOG("[interp] replay geometry: %llu binds from the frame's copies, %llu of them rewritten live since, %llu not found\n",
                           (unsigned long long)gb, (unsigned long long)gd, (unsigned long long)gm);
     }
+#endif
     if (st_replay_misses || st_replay_cb_miss)
         LOG("[interp] replay draw misses %llu/%llu, uniform misses %llu\n", (unsigned long long)st_replay_misses,
             (unsigned long long)st_replay_draws, (unsigned long long)st_replay_cb_miss);
