@@ -1640,8 +1640,14 @@ static void ip_presented(double t, double target, int kind) {
     static double last, win0, sum, sum2, dmin = 1e9, dmax, late, period_ms;
     static uint64_t nd, shown[3], dropped, even;
     pthread_mutex_lock(&st_mx);
-    if (t <= 0) dropped++;
-    else {
+    if (t <= 0) {
+        // (half a second of images the system didn't show: the window's state then says why - a covered window shows none)
+        if (++dropped == 60 && window) {
+            SDL_WindowFlags f = SDL_GetWindowFlags(window);
+            LOG("[interp] images not reaching the screen: window %s%s%s\n", f & SDL_WINDOW_INPUT_FOCUS ? "focused" : "not focused",
+                f & SDL_WINDOW_OCCLUDED ? ", covered" : "", f & SDL_WINDOW_MINIMIZED ? ", minimized" : "");
+        }
+    } else {
         if (last > 0 && t > last) {
             double d = (t - last) * 1000;
             sum += d, sum2 += d * d, nd++;
@@ -1704,14 +1710,27 @@ static void ip_tick(uint64_t tp) {
     // The window's presents can queue up behind each other (seen: images on screen 1 to 4 vsyncs after the one they
     // were made for, steady for a whole run): each vsync of that queue is latency. One vsync without a present lets
     // it shrink by one - a single repeated image - until images reach the screen one vsync after theirs.
+    // What a skip can't shrink is the window system's own delay, not a queue: 16.7 ms here, one vsync at 60 Hz but two at
+    // 120, where skipping went on every 60 vsyncs for the whole run (118 images/s, a hole twice a second on an M5's 120 Hz
+    // screen). A skip that gained nothing makes that lateness the floor; only a vsync past the floor is a queue.
     static int drain_wait;
-    if (drain_wait > 0) drain_wait--;
-    else if (atomic_load(&ip_late_ns) > 1.8 * P) {  // (a whole extra vsync, not single late images)
-        drain_wait = 60;
-        static int nlog;
-        if (nlog++ < 10) LOG("[interp] window presents %.1f ms behind: one vsync skipped\n", atomic_load(&ip_late_ns) / 1e6);
-        atomic_store(&ip_late_ns, (int64_t)P);
-        return;
+    static int64_t drain_before, drain_floor;
+    int64_t late = atomic_load(&ip_late_ns);
+    if (drain_wait > 0) {
+        if (--drain_wait == 0 && late > drain_before - 0.5 * P) {
+            drain_floor = late < drain_before ? late : drain_before;
+            LOG("[interp] window presents %.1f ms behind after a skip: the window system's own delay, no skips for that\n", drain_floor / 1e6);
+        }
+    } else {
+        if (late < drain_floor - 0.5 * P) drain_floor = late;  // (less delay now: full screen, another display)
+        if (late > fmax(1.8 * P, drain_floor + 0.8 * P)) {  // (a whole extra vsync, not single late images)
+            drain_wait = 60;
+            drain_before = late;
+            static int nlog;
+            if (nlog++ < 10) LOG("[interp] window presents %.1f ms behind: one vsync skipped\n", late / 1e6);
+            atomic_store(&ip_late_ns, (int64_t)P);
+            return;
+        }
     }
     pthread_mutex_lock(&sl_mx);
     int best = -1;
