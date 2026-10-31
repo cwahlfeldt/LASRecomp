@@ -15,6 +15,7 @@
 #include "nvn.h"
 #include "renderer.h"
 #include "pace.h"
+#include "interp.h"
 #include "shader_prep.h"
 #include "recolour.h"
 #include "slowframe.h"
@@ -479,8 +480,11 @@ void renderer_submit(void) {
     if (cmdbuf) {
         id<MTLCommandBuffer> c = cmdbuf;
         cmdbuf = nil;
+        bool replay = g_interp_replaying;
         [c addCompletedHandler:^(id<MTLCommandBuffer> done) {
+            // (frame interpolation's replays count as the game's work: Dynamic budgets the frame and its in-betweens)
             stat_gpu_s += renderer_gpu_busy(done, false) / 1e9;
+            if (replay) interp_replay_gpu((done.GPUEndTime - done.GPUStartTime) * 1e3);
             if (done.error) LOG("[metal] command buffer error: %s\n", done.error.localizedDescription.UTF8String);
         }];
         [c commit];
@@ -1178,10 +1182,69 @@ static bool dyn_copy(uint64_t addr, uint64_t size) {
     stat_vcopy++; stat_vcopy_bytes += size;
     return true;
 }
+// Frame interpolation: the per-frame geometry above as the frame drew it, for its replays (letsgo-recomp 0.6.0: a
+// replay's draw binds the vertex and index data frame N's same draw had). In place, a replay - encoded after the
+// frame and run later still on a busy GPU - reads whatever the game has written there for its next frames by then
+// (the ring is reused once the frame's fence passed), and its depth pre-pass and colour pass could read different
+// data. The frame copies each such range at its bind (~25 KB a frame); a replay binds the copies in bind order.
+// (The stats line "replay geometry" counts them, and those the game had already rewritten when the replay was
+// encoded - none in the beach runs; the GPU reads later still.) LARECOMP_INTERP_GEO_COPY=0: in place (research).
+typedef struct { uint64_t addr, size, off; __unsafe_unretained id<MTLBuffer> buf; } IvRec;
+static IvRec *iv_log; static uint32_t iv_n, iv_cap, iv_rp;
+static uint64_t iv_serial = ~0ull, iv_off, iv_binds, iv_differed, iv_missed;
+static NSMutableArray *iv_bufs;  // (holds the frame's chunks until the next frame's first copy)
+static __unsafe_unretained id<MTLBuffer> iv_chunk;
+#define IV_CHUNK (1u << 20)
+void renderer_interp_geo_stats(uint64_t *binds, uint64_t *differed, uint64_t *missed) {
+    *binds = iv_binds, *differed = iv_differed, *missed = iv_missed;
+    iv_binds = iv_differed = iv_missed = 0;
+}
+static bool iv_geometry(uint64_t addr, uint64_t size, id<MTLBuffer> __strong *buf, uint64_t *off) {
+    static int on = -1;
+    if (on < 0) { const char *x = ENV("LARECOMP_INTERP_GEO_COPY"); on = !x || atoi(x) != 0; }
+    if (!on || !g_interp_log || size > IV_CHUNK) return false;
+    extern int nvn_pool_flags_at(uint64_t addr);
+    if ((nvn_pool_flags_at(addr) & 0x13) != 0x12) return false;  // (static meshes: cached pools, in place)
+    if (!g_interp_replaying) {
+        if (interp_frame_serial() != iv_serial) {
+            iv_serial = interp_frame_serial();
+            iv_n = 0, iv_off = IV_CHUNK, iv_bufs = [NSMutableArray array], iv_chunk = nil;
+        }
+        uint64_t o = (iv_off + 255) & ~255ull;
+        if (!iv_chunk || o + size > IV_CHUNK) {
+            id<MTLBuffer> c = [dev newBufferWithLength:IV_CHUNK options:MTLResourceStorageModeShared];
+            [iv_bufs addObject:c];
+            iv_chunk = c, o = 0;
+        }
+        memcpy((uint8_t *)iv_chunk.contents + o, (const void *)(uintptr_t)addr, size);
+        iv_off = o + size;
+        if (iv_n == iv_cap) { iv_cap = iv_cap ? iv_cap * 2 : 1024; iv_log = realloc(iv_log, sizeof *iv_log * iv_cap); }
+        iv_log[iv_n++] = (IvRec){addr, size, o, iv_chunk};
+        return false;  // (the frame itself reads in place, as before)
+    }
+    if (interp_frame_serial() != iv_serial) { iv_missed++; return false; }
+    for (uint32_t j = iv_rp; j < iv_n && j < iv_rp + 32; j++)
+        if (iv_log[j].addr == addr && iv_log[j].size == size) {
+            iv_rp = j + 1;
+            iv_binds++;
+            if (memcmp((uint8_t *)iv_log[j].buf.contents + iv_log[j].off, (const void *)(uintptr_t)addr, size)) iv_differed++;
+            *buf = iv_log[j].buf, *off = iv_log[j].off;
+            return true;
+        }
+    iv_missed++;
+    return false;
+}
+
 static void bind_guest(id<MTLRenderCommandEncoder> e, bool vertex_stage, uint64_t addr, uint64_t size, int index) {
     if (addr >= HEAP_BASE && addr + size <= HEAP_BASE + HEAP_MAX && (addr & 3) == 0) {
         bind_note(0, addr, size);  // (LARECOMP_LOG_BINDS: the race detector still reports the rewrites; copied, they are harmless)
         snap_note_vertex_bind(addr, size);
+        id<MTLBuffer> ivb; uint64_t ivo;
+        if (iv_geometry(addr, size, &ivb, &ivo)) {
+            if (vertex_stage) [e setVertexBuffer:ivb offset:ivo atIndex:index];
+            else [e setFragmentBuffer:ivb offset:ivo atIndex:index];
+            return;
+        }
         if (!dyn_copy(addr, size)) {
             if (vertex_stage) [e setVertexBuffer:g_guest_buffer offset:addr - HEAP_BASE atIndex:index];
             else [e setFragmentBuffer:g_guest_buffer offset:addr - HEAP_BASE atIndex:index];
@@ -2024,6 +2087,7 @@ static void bind_textures(int stage, ShaderInfo *si) {
         if (i < 64) { tex_wh[stage][i][0] = tex_wh[stage][i][1] = 0; tex_fr[stage][i][0] = tex_fr[stage][i][1] = 1; }
         if (h && st.tpool && tic < (uint32_t)st.tpool->count) {
             NvnTexEntry *e = &((NvnTexEntry *)st.tpool->entries)[tic];
+            if (g_interp_log) e = (NvnTexEntry *)interp_texentry(stage, i, e, sizeof *e);  // (frame interpolation: the frame's entry)
             if (e->tex) tex = sampled_texture(e->tex, &e->view, e->has_view, st_->type);
             else if (e->dead_format) nvn_dead_slot_sampled(e, tic);
             if (e->tex && stage == 1) {
@@ -2366,8 +2430,18 @@ static void snap_note_vertex_bind(uint64_t addr, uint64_t size) {  // (LARECOMP_
             n++; LOG("[snap] vertex bind %llx+%llu overlaps copied %llx+%llu (%s, frame %llu)\n", (unsigned long long)addr, (unsigned long long)size, (unsigned long long)rs_tab[i].addr, (unsigned long long)rs_tab[i].size, addr < rs_tab[i].addr ? "from outside" : "inside", (unsigned long long)renderer_exec_frame());
         }
 }
+// The table's current address for a range, read only (a replay whose draw wasn't found in the log): its copy, or the
+// original when it has none (in place, or a per-frame block copied without an entry).
+static uint64_t snap_lookup(uint64_t addr, uint64_t size) {
+    if (!snap_on()) return addr;
+    for (int i = 0; i < nrs; i++)
+        if (rs_tab[i].addr == addr && rs_tab[i].size == size) return rs_tab[i].mode != RS_PLACE && rs_tab[i].copy ? rs_tab[i].copy : addr;
+    return addr;
+}
+static uint64_t g_bound_sbuf[2][16];  // the storage addresses the current draw's stages bound (copy or original)
 // The address a binder of [addr, addr+size) uses: the original or its copy (cs_slot: bound by a compute dispatch)
 static uint64_t snap_storage(uint64_t addr, uint64_t size, bool cs_slot) {
+    if (g_interp_replaying) return snap_lookup(addr, size);  // (replays never create, age, release or remake entries)
     if (!snap_on() || !addr || !size || size > SNAP_RING / 8 || addr < HEAP_BASE || addr + size > snap_ring_base) return addr;
     extern int nvn_pool_flags_at(uint64_t addr);
     int pf = nvn_pool_flags_at(addr);
@@ -2477,6 +2551,7 @@ static uint64_t snap_storage(uint64_t addr, uint64_t size, bool cs_slot) {
 }
 
 static void bind_cbufs(int stage, ShaderInfo *si) {
+    for (int i = 0; i < 16; i++) g_bound_sbuf[stage][i] = st.sbuf[stage][i].addr;  // (no driver constants: read in place)
     for (int k = 0; k < 18; k++) {
         if (!(si->cbuf_mask & (1u << k))) continue;
         if (k == 0) {
@@ -2484,10 +2559,26 @@ static void bind_cbufs(int stage, ShaderInfo *si) {
             // per hardware stage at 0x110 + 0x100 * stage (vertex 0, fragment 4)
             uint32_t drv[0x800 / 4] = {0};
             uint32_t base = 0x110 + 0x100 * (stage == 1 ? 4 : 0);
+            // The storage addresses the draw reads: the real frame takes them from the snapshot table (copies of what
+            // the CPU rewrites) and logs them with the draw; a replay binds the frame's own (its copies, made when it
+            // ran) and never touches the table - running it there (a "frame" 2^40 ahead) released every copy and
+            // remade them from live memory: the in-betweens 44% darker, the beach sand teal (2026-10-26).
+            uint64_t sav[16];
+            bool reads = false;
+            for (int i = 0; i < 16; i++) { sav[i] = st.sbuf[stage][i].addr; reads |= sav[i] && (si->ssbo_read & (1u << i)); }
+            if (reads && g_interp_replaying) {
+                const uint64_t *lg = interp_cbuf(4 + stage, 0, 0, sav, sizeof sav, 0);
+                if (lg != sav) memcpy(sav, lg, sizeof sav);
+                else for (int i = 0; i < 16; i++) if (sav[i] && (si->ssbo_read & (1u << i))) sav[i] = snap_lookup(sav[i], st.sbuf[stage][i].size);
+            } else if (reads) {
+                for (int i = 0; i < 16; i++)
+                    if (sav[i] && (si->ssbo_read & (1u << i))) { bind_note(2, sav[i], st.sbuf[stage][i].size); sav[i] = snap_storage(sav[i], st.sbuf[stage][i].size, false); }
+                if (g_interp_log) interp_cbuf(4 + stage, 0, 0, sav, sizeof sav, 0);
+            }
+            memcpy(g_bound_sbuf[stage], sav, sizeof sav);
             for (int i = 0; i < 16; i++) {
                 uint32_t *e = &drv[(base + 16 * i) / 4];
-                uint64_t sa = st.sbuf[stage][i].addr;
-                if (sa && (si->ssbo_read & (1u << i))) { bind_note(2, sa, st.sbuf[stage][i].size); sa = snap_storage(sa, st.sbuf[stage][i].size, false); }
+                uint64_t sa = sav[i];
                 e[0] = (uint32_t)sa;
                 e[1] = (uint32_t)(sa >> 32);
                 e[2] = (uint32_t)st.sbuf[stage][i].size;
@@ -2520,7 +2611,12 @@ static void bind_cbufs(int stage, ShaderInfo *si) {
         if ((si->cbuf_dynamic & (1u << k)) && r.size) size = r.size > 0x10000 ? 0x10000 : r.size;  // indexed: whole buffer
         if (size > r.size && r.size) size = r.size;
         if (size < 16) size = 16;
-        uint64_t off = ring_alloc((void *)(uintptr_t)r.addr, size);  // snapshot, as later CPU writes must not leak in
+        const void *src = (const void *)(uintptr_t)r.addr;
+        if (g_interp_log) {  // (frame interpolation: logged / blended copy; compared over the bytes the shader reads)
+            uint64_t used = si->cbuf_used[k] && si->cbuf_used[k] < size ? si->cbuf_used[k] : size;
+            src = interp_cbuf(stage, k, idx, src, size, used);
+        }
+        uint64_t off = ring_alloc(src, size);  // snapshot, as later CPU writes must not leak in
         if (stage == 0) [enc setVertexBuffer:ring offset:off atIndex:k];
         else [enc setFragmentBuffer:ring offset:off atIndex:k];
     }
@@ -2897,7 +2993,7 @@ static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
     LOG(" | fubo0:");
     for (int i = 0; i < 6; i++)
         if (st.ubuf[1][i].addr) { const float *f = (const float *)(uintptr_t)st.ubuf[1][i].addr; LOG(" f%d=[%g %g %g %g]", i, f[0], f[1], f[2], f[3]); }
-    LOG(" | ssbo:");
+    LOG(" | gmem v%d f%d ssbo_read v%#x f%#x ssbo:", pr->vi->uses_gmem, pr->fi->uses_gmem, pr->vi->ssbo_read, pr->fi->ssbo_read);
     for (int sg = 0; sg < 2; sg++)
         for (int i = 0; i < 16; i++)
             if (st.sbuf[sg][i].addr) LOG(" %c%d(%llx,%llu)", sg ? 'f' : 'v', i, st.sbuf[sg][i].addr, st.sbuf[sg][i].size);
@@ -3348,6 +3444,42 @@ static void draw(CmdRec *r, bool indexed) {
     float zn = st.depth_range[0][0], zf = st.depth_range[0][1];
 
     // resources
+    if (g_interp_log) {  // (frame interpolation, runtime/nvn/interp.c: the draw's identity across frames)
+        // LARECOMP_INTERP_KEY=<mask> (research): 1 draw arguments, 2 index buffer address, 4 programs, 8 vertex buffer 0
+        // address, 16 target object, 32 target class (format, depth-only, aspect: not the size - Dynamic resolution
+        // changes the targets' size between frames, and keyed by size every draw of such a frame went unmatched: a
+        // cut, an interval without in-betweens; Dusklight keys by the object, never by a target). Default 37: the
+        // game's render-target objects and its dynamic geometry's buffers change from frame to frame (measured: 44%
+        // matched with them, 100% without, Mabe Village).
+        static int kmask = -1;
+        if (kmask < 0) kmask = getenv("LARECOMP_INTERP_KEY") ? atoi(getenv("LARECOMP_INTERP_KEY")) : 37;
+        uint64_t args[7];
+        memcpy(args, r->x, sizeof args);
+        if (indexed && !(kmask & 2)) args[3] = 0;
+        NvnTexture *kt = st.rt.ncolor ? st.rt.color[0] : st.rt.depth;
+        uint64_t key = (kmask & 1) ? hmix(1469598103934665603ull, args, sizeof args) : 1469598103934665603ull;
+        uint64_t ids[5] = {(kmask & 4) ? st.program->stages[0].code_addr : 0, (kmask & 4) ? st.program->stages[1].code_addr : 0,
+                           (kmask & 8) ? st.vbuf[0].addr : 0, (kmask & 16) ? (uint64_t)(uintptr_t)kt : 0,
+                           (kmask & 32) && kt ? (uint64_t)kt->format << 32 | (st.rt.ncolor ? 0 : 1u << 31) | (kt->height ? kt->width * 16 / kt->height : 0) : 0};
+        uint64_t fkey = hmix(key, ids, sizeof ids);
+        {   // LARECOMP_INTERP_LOG_KEYS=1 (research): each key's components once
+            static int on = -1; static uint64_t seen[4096]; static int nseen;
+            if (on < 0) on = getenv("LARECOMP_INTERP_LOG_KEYS") != NULL;
+            if (on) {
+                bool known = false;
+                for (int i = 0; i < nseen; i++) if (seen[i] == fkey) { known = true; break; }
+                if (!known && nseen < 4096) {
+                    seen[nseen++] = fkey;
+                    LOG("[interp-key] %016llx vs %llx fs %llx fshash %016llx mode %llu count %llu inst %llu rt %ux%u ncolor %d fmt %#x depth %p dswrite %d ub0 %u ub1 %u ub2 %u ub3 %u ntex %d\n",
+                        (unsigned long long)fkey, st.program->stages[0].code_addr, st.program->stages[1].code_addr, (unsigned long long)g_cur_fs_hash,
+                        r->x[0], r->x[2], indexed ? r->x[6] : r->x[4], kt ? kt->width : 0, kt ? kt->height : 0, st.rt.ncolor,
+                        kt ? kt->format : 0, (void *)st.rt.depth, st.ds[0] && st.ds[1], (unsigned)st.ubuf[0][0].size, (unsigned)st.ubuf[0][1].size,
+                        (unsigned)st.ubuf[0][2].size, (unsigned)st.ubuf[0][3].size, pr->fi->ntex);
+                }
+            }
+        }
+        interp_draw(fkey, st.rt.ncolor == 0);
+    }
     bind_cbufs(0, pr->vi);
     bind_cbufs(1, pr->fi);
     // (debug, LARECOMP_LOG_BINDS) shaders loading global memory read through pointers in their uniform buffers: note
@@ -3371,6 +3503,17 @@ static void draw(CmdRec *r, bool indexed) {
             }
         }
     }
+    if (g_interp_log && !g_interp_replaying && (pr->vi->uses_gmem || pr->fi->uses_gmem))  // (frame interpolation: the storage read live)
+        for (int s_ = 0; s_ < 2; s_++) {
+            ShaderInfo *si = s_ ? pr->fi : pr->vi;
+            if (!si->uses_gmem) continue;
+            // (only what the draw read in place: a snapshot copy is the frame's own, and the replays bind that copy, so
+            // the game rewriting the original meanwhile - the tiled light lists, rewritten for the next frame while
+            // this one is drawn - can't reach them; checked, it cut the in-betweens for seconds at a time)
+            for (int i = 0; i < 16; i++)
+                if ((si->ssbo_read & (1u << i)) && st.sbuf[s_][i].addr && g_bound_sbuf[s_][i] == st.sbuf[s_][i].addr)
+                    interp_storage(st.sbuf[s_][i].addr, st.sbuf[s_][i].size);
+        }
     if (pr->vi->uses_gmem) [enc setVertexBuffer:g_guest_buffer offset:0 atIndex:GMEM_BUFFER_INDEX];
     static id<MTLBuffer> dbgvs;
     bool dbg_this = maxwell_dbg_vs && (const uint8_t *)(uintptr_t)st.program->stages[0].code_addr == maxwell_dbg_vs;
@@ -3614,7 +3757,10 @@ static void draw(CmdRec *r, bool indexed) {
             uint64_t ioff;
             bool in_heap = iaddr >= HEAP_BASE && iaddr + (uint64_t)count * isz <= HEAP_BASE + HEAP_MAX && (iaddr % isz) == 0;
             if (in_heap) { bind_note(1, iaddr, (uint64_t)count * isz); snap_note_vertex_bind(iaddr, (uint64_t)count * isz); }
-            if (in_heap && !dyn_copy(iaddr, (uint64_t)count * isz)) {
+            id<MTLBuffer> ivb; uint64_t ivo;
+            if (in_heap && iv_geometry(iaddr, (uint64_t)count * isz, &ivb, &ivo)) {
+                ib = ivb; ioff = ivo;
+            } else if (in_heap && !dyn_copy(iaddr, (uint64_t)count * isz)) {
                 ib = g_guest_buffer; ioff = iaddr - HEAP_BASE;
             } else {
                 ioff = ring_alloc((void *)(uintptr_t)iaddr, (uint64_t)count * isz); ib = ring;
@@ -4135,6 +4281,8 @@ static void exec_list(uint64_t handle, int depth) {
             }
             break;
         case CMD_DISPATCH:
+            if (g_interp_replaying) break;  // (a replayed frame: the frame's compute results are already there)
+            if (g_interp_log) for (int i = 0; i < 16; i++) if (st.sbuf[5][i].addr) interp_dispatch_output(st.sbuf[5][i].addr, st.sbuf[5][i].size);
             dispatch_compute((uint32_t)r->x[0], (uint32_t)r->x[1], (uint32_t)r->x[2]);
             if (st.program) {
                 static uint64_t seen[16];
@@ -4178,9 +4326,11 @@ static void exec_list(uint64_t handle, int depth) {
         case CMD_DRAW_ELEMENTS: draw(r, true); break;
         case CMD_UPDATE_UNIFORM_BUFFER:
             // (buffer, size, offset, dataSize, data): apply the update in command order
+            if (g_interp_replaying) break;  // (replay: the draws read their logged uniform copies)
             memcpy((void *)(uintptr_t)(r->x[0] + r->x[2]), x, r->x[3]);
             break;
         case CMD_FENCE_SYNC: {
+            if (g_interp_replaying) break;  // (replays leave the game's fences, counters and memory alone)
             // The CPU may read GPU-written memory (compute results) once the fence is signaled.
             static int fence_flush = -1;
             if (fence_flush < 0) fence_flush = getenv("LARECOMP_FENCE_FLUSH") ? 1 : 0;
@@ -4190,6 +4340,7 @@ static void exec_list(uint64_t handle, int depth) {
             break;
         }
         case CMD_REPORT_COUNTER: {
+            if (g_interp_replaying) break;
             uint64_t *out = (uint64_t *)(uintptr_t)r->x[1];
             static uint32_t seen;
             uint32_t type = (uint32_t)r->x[0];
@@ -4232,8 +4383,9 @@ static void exec_list(uint64_t handle, int depth) {
             break;
         }
         case CMD_COPY_BUFFER_TO_TEXTURE: copy_buffer_to_texture(r->x[0], x); break;
-        case CMD_COPY_TEXTURE_TO_BUFFER: copy_texture_to_buffer(x, r->x[3]); break;
+        case CMD_COPY_TEXTURE_TO_BUFFER: if (!g_interp_replaying) copy_texture_to_buffer(x, r->x[3]); break;
         case CMD_COPY_BUFFER_TO_BUFFER:
+            if (g_interp_replaying) break;
             { static int nlog; if (nlog++ < 40 && ENV("LARECOMP_LOG_BINDS")) LOG("[copybuf] frame %llu %llx -> %llx %llu bytes\n", (unsigned long long)renderer_exec_frame(), r->x[0], r->x[1], r->x[2]); }
             renderer_flush();
             memmove((void *)(uintptr_t)r->x[1], (void *)(uintptr_t)r->x[0], r->x[2]);
@@ -4393,7 +4545,30 @@ void renderer_reset(void) {
     st_defaults();
 }
 
+// Frame interpolation (runtime/nvn/interp.c): the bound state at the frame's first list, and a replay of the frame's
+// lists with the logged (blended) uniforms - the game's own state is restored after it. The caller holds
+// interp_replay_lock and has set the render scale the frame was drawn at.
+static __typeof__(st) st_frame_begin;
+void renderer_interp_replay(void) {
+    const uint64_t *h;
+    uint32_t n = interp_handles(&h);
+    __typeof__(st) st_end = st;
+    bool log = g_interp_log;
+    st = st_frame_begin;
+    g_interp_log = true;
+    iv_rp = 0;
+    interp_replay_begin();
+    @autoreleasepool {
+        for (uint32_t i = 0; i < n; i++) exec_list(h[i], 0);
+        renderer_submit();
+    }
+    interp_replay_end();
+    g_interp_log = log;
+    st = st_end;
+}
+
 void backend_execute(uint64_t handle) {
+    if (interp_list_submitted(handle)) st_frame_begin = st;
     @autoreleasepool {
         exec_list(handle, 0);
         static int sync_submit = -1;

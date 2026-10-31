@@ -30,6 +30,7 @@ uint64_t rq_current_item(void);  // on the render thread: the item being run; el
 // first use in a frame, the widescreen composite, texture change checks) follows the frame being translated;
 // renderer_present_count() stays the game thread's (the HLE hooks compare frames against it).
 uint64_t rq_frame(void);
+bool rq_present_is_repeat(void);  // (render thread, in backend_present_now) a backend_represent: no new frame
 void rq_drain(void);   // every queued item done (QueueFinish; reboot)
 void rq_flush(void);   // drain, then the backend's full flush, on the render thread (nvnSyncWait with LARECOMP_SYNC_FLUSH)
 // Quitting (the window closed, exit()): the render thread stops after the item it runs; true from then on (the

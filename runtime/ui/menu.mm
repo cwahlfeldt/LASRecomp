@@ -416,6 +416,10 @@ static void tab_display(void) {
         g_want_fullscreen_apply.store(true);
     }
     opt_toggle("Show FPS", &g_settings.show_fps, false, "Shows the frame rate in the top right corner.");
+#ifdef __APPLE__
+    opt_toggle("Frame interpolation", &g_settings.frame_interp, false,
+               "Draws extra images between the game's frames, for smoother motion up to your display's refresh rate.");
+#endif
 
     opt_section("Rendering");
     // display order -> RES_* (the ini / enum order predates the menu order)

@@ -37,6 +37,7 @@ typedef struct {
     bool reverb;         // room reverb effect
     bool movie_audio;
     bool show_fps;
+    bool frame_interp;   // extra images between the game's frames (runtime/nvn/interp.c; Metal)
     bool dpad_move;      // the d-pad (and arrow keys) move Link like the stick
     bool rumble;         // controller vibration from the game (runtime/hle/input.c)
     int rumble_strength; // its intensity, percent (25 / 50 / 75 / 100)
